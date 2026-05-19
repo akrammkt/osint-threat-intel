@@ -9,9 +9,16 @@ from core.database import get_indicators
 # Run every collector and store the results in the database.
 run_collection()
 
-# Show a sample of what was collected.
 collected = get_indicators(status="collected")
 print(f"\nTotal indicators with status 'collected': {len(collected)}")
-print("\nSample of suspicious look-alike domains found:")
+
+# Highlight any domains corroborated by more than one source.
+corroborated = [i for i in collected if "," in i.source]
+if corroborated:
+    print(f"\nDomains flagged by MULTIPLE sources ({len(corroborated)}):")
+    for ind in corroborated:
+        print(f"  - {ind.value:<40} sources: {ind.source}")
+
+print("\nSample of suspicious domains found:")
 for ind in collected[:15]:
-    print(f"  - {ind.value:<45} (first seen {ind.first_seen[:10]})")
+    print(f"  - {ind.value:<45} [{ind.source}]")

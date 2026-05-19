@@ -27,3 +27,7 @@ BRAND_KEYWORDS = ["paypal"]
 # --- Collection settings ---
 CRTSH_MAX_RESULTS = 200      # max certificates processed per crt.sh query
 CRTSH_TIMEOUT = 60           # seconds to wait for a crt.sh response
+
+# --- dnstwist collector settings ---
+DNSTWIST_DOMAIN = "paypal.com"   # the brand domain whose look-alikes we generate
+DNSTWIST_THREADS = 50            # parallel DNS lookups (higher = faster)
