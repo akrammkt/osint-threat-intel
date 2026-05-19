@@ -1,0 +1,25 @@
+# Virtual environment
+venv/
+
+# Python
+__pycache__/
+*.pyc
+
+# Local database (runtime data — not committed)
+*.db
+*.sqlite
+*.sqlite3
+
+# Secrets
+.env
+
+# IDE
+.vscode/
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# Logs and exported reports
+*.log
+exports/

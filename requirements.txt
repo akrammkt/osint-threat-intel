@@ -1,0 +1,9 @@
+requests
+schedule
+python-whois
+dnstwist
+python-Levenshtein
+tldextract
+pandas
+streamlit
+plotly
