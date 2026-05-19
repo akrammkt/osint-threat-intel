@@ -4,19 +4,20 @@ processing/enrichment.py
 Second half of the processing stage: ENRICHMENT.
 
 A normalised domain on its own is just a string. Enrichment adds the context
-the scoring stage needs to judge how dangerous it is:
+the scoring and correlation stages need:
 
-  1. domain_age_days  - how recently the domain was registered (via WHOIS).
-                        Phishing domains are typically very young; legitimate
-                        businesses usually have domains years old.
+  1. domain_age_days   - how recently the domain was registered (via WHOIS).
+                         Phishing domains are typically very young.
 
-  2. brand_similarity - how visually/textually close the domain is to the
-                        protected brand (0.0 = unrelated, 1.0 = identical).
-                        A high score means the domain is a convincing
-                        look-alike designed to deceive victims.
+  2. brand_similarity  - how visually/textually close the domain is to the
+                         protected brand (0.0 = unrelated, 1.0 = identical).
 
-  3. typo_technique   - if the domain came from dnstwist, which typosquatting
-                        method produced it (homoglyph, omission, ...).
+  3. whois_registrant  - the organisation/name that registered the domain.
+                         The correlation stage uses this to group domains
+                         registered by the same entity into one campaign.
+
+  4. typo_technique    - if the domain came from dnstwist, which typosquatting
+                         method produced it (homoglyph, omission, ...).
 """
 
 from datetime import datetime, timezone
@@ -28,34 +29,43 @@ from config import PROTECTED_BRAND
 
 
 # ---------------------------------------------------------------------------
-# 1. WHOIS domain age
+# WHOIS lookup - age and registrant in a single query
 # ---------------------------------------------------------------------------
-def get_domain_age_days(domain: str):
+def get_whois_info(domain: str) -> dict:
     """
-    Return the age of a domain in days from its WHOIS creation date.
-    Returns None if WHOIS data is unavailable (common for privacy-protected
-    or very new domains) - the scoring stage handles that case explicitly.
+    Look up a domain's WHOIS record once and return both its age in days and
+    its registrant. Either value may be None if WHOIS does not provide it
+    (common for privacy-protected or very new domains).
     """
+    info = {"age_days": None, "registrant": None}
     try:
         record = whois.whois(domain)
+
+        # --- creation date -> age in days ---
         created = record.creation_date
-        # WHOIS sometimes returns a list of dates - take the earliest
         if isinstance(created, list):
             created = created[0]
-        if not isinstance(created, datetime):
-            return None
-        # make both datetimes timezone-aware for a safe subtraction
-        if created.tzinfo is None:
-            created = created.replace(tzinfo=timezone.utc)
-        age = datetime.now(timezone.utc) - created
-        return max(age.days, 0)
+        if isinstance(created, datetime):
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            info["age_days"] = max((datetime.now(timezone.utc) - created).days, 0)
+
+        # --- registrant: prefer the organisation, fall back to the name ---
+        registrant = record.org or record.name
+        if isinstance(registrant, list):
+            registrant = registrant[0]
+        if registrant and str(registrant).strip():
+            info["registrant"] = str(registrant).strip()
+
     except Exception:
-        # any WHOIS failure (rate limit, no record, parse error) -> unknown
-        return None
+        # any WHOIS failure (rate limit, no record, parse error) -> leave None
+        pass
+
+    return info
 
 
 # ---------------------------------------------------------------------------
-# 2. Brand similarity
+# Brand similarity
 # ---------------------------------------------------------------------------
 def brand_similarity(domain: str) -> float:
     """
@@ -66,15 +76,12 @@ def brand_similarity(domain: str) -> float:
     Levenshtein similarity ratio against the brand to catch near-misses like
     'paypa1' or 'payqal'.
     """
-    # strip the TLD - compare only the meaningful part of the domain
-    name = domain.split(".")[0]
+    name = domain.split(".")[0]   # compare only the meaningful part
 
     if PROTECTED_BRAND in name:
-        # brand contained verbatim: score 0.90-1.00 depending on extra noise
         extra = len(name) - len(PROTECTED_BRAND)
         return round(max(1.0 - extra * 0.02, 0.90), 3)
 
-    # otherwise: textual closeness to the brand (homoglyphs, typos)
     return round(Levenshtein.ratio(name, PROTECTED_BRAND), 3)
 
 
@@ -83,14 +90,16 @@ def brand_similarity(domain: str) -> float:
 # ---------------------------------------------------------------------------
 def enrich(indicator):
     """
-    Enrich one indicator in place: add domain age, brand similarity, and the
-    typosquatting technique. Advances its status to 'enriched'.
+    Enrich one indicator in place: WHOIS age + registrant, brand similarity,
+    and the typosquatting technique. Advances its status to 'enriched'.
     """
-    age = get_domain_age_days(indicator.value)
+    whois_info = get_whois_info(indicator.value)
+    age = whois_info["age_days"]
 
     indicator.enrichment = {
         "domain_age_days": age,
         "age_known": age is not None,
+        "whois_registrant": whois_info["registrant"],
         "brand_similarity": brand_similarity(indicator.value),
         "typo_technique": indicator.raw.get("fuzzer", "n/a"),
         "source_count": len(indicator.source.split(",")),
