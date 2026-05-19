@@ -16,7 +16,8 @@ PROTECTED_BRAND = "paypal"
 # The real, legitimate domains owned by the brand. These are never flagged
 # as threats - they are the baseline we compare suspicious domains against.
 LEGITIMATE_DOMAINS = [
-    "paypal.com", "paypal.me", "paypal.co.uk",
+    "paypal.com", "paypal.me", "paypal.co.uk", "paypal.de",
+    "paypal.fr", "paypal.es", "paypal.it", "paypal.nl", "paypal.ca",
     "paypalcorp.com", "paypalinc.com", "paypalcredit.com",
     "paypal-engineering.com", "paypalobjects.com", "paypal-prod.com",
 ]
