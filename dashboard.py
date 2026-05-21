@@ -168,20 +168,28 @@ st.sidebar.caption(f"{len(brands)} brand(s) scanned so far")
 # --------------------------------------------------------------------------
 @st.cache_data
 def load_data(brand: str) -> pd.DataFrame:
-    indicators = get_indicators(status="scored", brand=brand)
+    # observation stage advances status from 'scored' to 'observed', so include both
+    indicators = get_indicators(status="scored") + get_indicators(status="observed")
     rows = []
     for i in indicators:
         e = i.enrichment
+        obs = i.observation or {}
         rows.append({
             "domain": i.value,
             "score": i.score,
             "risk_level": e.get("risk_level", "LOW"),
             "campaign": i.campaign_id or "",
+            "stage": obs.get("stage", "—"),
+            "stage_confidence": obs.get("confidence", 0.0),
+            "scheme": obs.get("scheme", ""),
+            "status_code": obs.get("status_code"),
+            "favicon_hash": obs.get("favicon_hash", ""),
             "domain_age_days": e.get("domain_age_days"),
             "brand_similarity": e.get("brand_similarity", 0.0),
             "typo_technique": e.get("typo_technique", "n/a"),
             "sources": i.source,
             "first_seen": i.first_seen[:10],
+            "observation_signals": ", ".join(obs.get("signals", [])),
         })
     return pd.DataFrame(rows)
 
@@ -205,6 +213,26 @@ col2.metric("Critical", int((df.risk_level == "CRITICAL").sum()))
 col3.metric("High", int((df.risk_level == "HIGH").sum()))
 col4.metric("Campaigns", df[df.campaign != ""].campaign.nunique())
 col5.metric("Alerts", int((df.score >= ALERT_THRESHOLD).sum()))
+
+# Prominent banner for confirmed phishing pages
+phishing_rows = df[df.stage.isin(["likely_phishing", "live_phishing"])]
+if not phishing_rows.empty:
+    n = len(phishing_rows)
+    with st.container(border=True):
+        st.markdown(f"### 🚨 {n} confirmed phishing page{'s' if n != 1 else ''} detected")
+        st.caption("These domains were observed serving brand-impersonating "
+                   "content with password fields. Treat as live threats.")
+        for _, row in phishing_rows.iterrows():
+            signals = []
+            if row.get("has_password", False):
+                signals.append("password field")
+            if row.get("brand_on_page", False):
+                signals.append("brand on page")
+            if row.get("page_title"):
+                signals.append(f'"{row.page_title[:60]}"')
+            sig_str = " · ".join(signals) if signals else "see Observation tab"
+            st.error(f"**`{row.domain}`** — score **{row.score}** — "
+                     f"campaign {row.campaign or '–'} — {sig_str}")
 
 st.divider()
 
@@ -230,21 +258,72 @@ if search:
 view = view.sort_values("score", ascending=False)
 
 
+
+# Pipeline architecture explainer
+with st.expander("ℹ️ How this tool works", expanded=False):
+    st.markdown("""
+    The pipeline runs **four sequential stages** against any monitored brand:
+
+    1. **Collection** — gathers candidate domains from two complementary OSINT sources:
+       Certificate Transparency logs (passive, via crt.sh) and active typosquatting
+       discovery (dnstwist generates ~1,370 look-alikes, DNS confirms which are registered).
+
+    2. **Processing** — collapses subdomains to their registered domain (Public Suffix List),
+       deduplicates across sources, and enriches each with WHOIS data (age, registrant) and
+       a brand-similarity score (Levenshtein + substring matching).
+
+    3. **Scoring** — combines four signals into a 0–100 early-warning score:
+       brand similarity (35 pts), domain youth (35 pts), source corroboration (20 pts),
+       active discovery (10 pts). High-scoring domains are clustered into **campaigns** by
+       shared infrastructure (IP, registrant).
+
+    4. **Observation** — fetches the homepage of each HIGH/CRITICAL domain, extracts content
+       features (page title, password fields, brand mentions), hashes the favicon, and
+       classifies what the domain is **currently being used for**.
+
+    *Total scan time: 4–8 minutes per brand. All data is stored locally in SQLite.*
+    """)
+
 # --------------------------------------------------------------------------
 # Tabs
 # --------------------------------------------------------------------------
-tab1, tab2, tab3, tab4 = st.tabs(
-    ["Threat list", "Campaigns", "Analytics", "Alerts & export"]
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    ["Threat list", "Campaigns", "Observation", "Analytics", "Alerts & export"]
 )
 
 with tab1:
     st.subheader(f"Ranked threats ({len(view)} shown)")
-    st.dataframe(
-        view[["domain", "score", "risk_level", "campaign",
-              "domain_age_days", "brand_similarity", "sources", "first_seen"]],
-        width="stretch",
-        hide_index=True,
-    )
+    event = st.dataframe(
+    view[cols],
+    width="stretch",
+    hide_index=True,
+    on_select="rerun",
+    selection_mode="single-row",
+    key="threat_table_select",
+)
+
+# Detail view for the selected row
+if event and event.selection and event.selection.rows:
+    sel = view.iloc[event.selection.rows[0]]
+    with st.container(border=True):
+        st.subheader(f"Details: `{sel.domain}`")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Score", sel.score)
+        c2.metric("Risk", sel.risk_level)
+        c3.metric("Stage", sel.get("stage") or "not observed")
+
+        st.write(f"**Sources:** {sel.sources}")
+        st.write(f"**First seen:** {sel.first_seen}")
+        age = sel.get("domain_age_days")
+        st.write(f"**Domain age:** {int(age)} days" if pd.notna(age) else "**Domain age:** unknown")
+        st.write(f"**Brand similarity:** {sel.brand_similarity:.2f}")
+        st.write(f"**Campaign:** {sel.campaign or '—'}")
+        if sel.get("page_title"):
+            st.write(f"**Page title:** {sel.page_title}")
+        if sel.get("final_url"):
+            st.write(f"**Final URL:** `{sel.final_url}`")
+        if sel.get("favicon_hash"):
+            st.write(f"**Favicon hash:** `{sel.favicon_hash}`")
 
 with tab2:
     campaigns = df[df.campaign != ""]
@@ -263,7 +342,38 @@ with tab2:
                     width="stretch", hide_index=True,
                 )
 
+# --- Tab 3: observation (what suspicious domains are being used for) ---
 with tab3:
+    observed = view[view.stage != "—"]
+    st.subheader(f"Live observation of {len(observed)} high-scoring domains")
+    if observed.empty:
+        st.info("No observations yet. Run the pipeline (`python main.py <brand>`) "
+                "and the observation stage will fetch each high-scoring domain.")
+    else:
+        # Stage-by-stage breakdown
+        stage_colors = {
+            "live_phishing":      "🔴 LIVE PHISHING",
+            "parked":             "🟡 parked",
+            "under_construction": "🟠 under construction",
+            "redirect":           "🔁 redirect",
+            "live":               "🟢 live (unrelated)",
+            "error":              "⚠️ http error",
+            "no_response":        "⚫ no response",
+        }
+        stage_counts = observed.stage.value_counts()
+        cols = st.columns(min(len(stage_counts), 5) or 1)
+        for idx, (stage, count) in enumerate(stage_counts.items()):
+            cols[idx % len(cols)].metric(stage_colors.get(stage, stage), count)
+
+        st.divider()
+        st.dataframe(
+            observed[["domain", "stage", "score", "risk_level", "scheme",
+                      "status_code", "observation_signals"]],
+            use_container_width=True, hide_index=True,
+        )
+
+
+with tab4:
     c1, c2 = st.columns(2)
     with c1:
         st.subheader("Risk level distribution")
@@ -288,7 +398,7 @@ with tab3:
     fig3 = px.line(timeline, x="first_seen", y="count", markers=True)
     st.plotly_chart(fig3, width="stretch")
 
-with tab4:
+with tab5:
     st.subheader(f"Active alerts (score >= {ALERT_THRESHOLD})")
     alerts = get_alerts(scored_indicators)
     if alerts:
