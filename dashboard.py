@@ -1,23 +1,29 @@
 """
 dashboard.py
 -------------
-Streamlit dashboard.
+Streamlit dashboard with on-demand pipeline scanning.
 
-Reads the latest brand from the database and presents its scored indicators
-as an interactive threat console: summary metrics, filters, a ranked threat
-table, the campaign view, charts, an alert panel, and IOC report export.
-
-In Step 12 this gains a search bar that triggers per-brand pipeline runs.
-For now it just displays whichever brand was most recently collected.
+A search bar at the top lets the user enter any domain and run the full
+threat-intelligence pipeline against it without touching the terminal.
+Past scans are preserved per-brand in the database; the sidebar selector
+switches between every brand that has been scanned.
 
 Run from the project root with:  streamlit run dashboard.py
 """
 
+import re
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-from core.database import get_indicators, list_brands
+from core.database import (
+    get_indicators, list_brands, init_db, clear_brand,
+)
+from core.schema import BrandProfile
+from config import KNOWN_PROFILES
+from collection.runner import run_collection
+from processing.runner import run_processing
+from scoring.runner import run_scoring
 from dissemination.alerting import get_alerts, write_alert_log, ALERT_THRESHOLD
 from dissemination.exporter import export_csv, export_json
 
@@ -25,9 +31,143 @@ from dissemination.exporter import export_csv, export_json
 st.set_page_config(page_title="OSINT Threat Intelligence", layout="wide")
 
 
+# --------------------------------------------------------------------------
+# Input handling and pipeline orchestration
+# --------------------------------------------------------------------------
+_INPUT_DOMAIN_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9-]{1,63}\.)+[a-z]{2,}$")
+
+
+def normalize_input(raw: str) -> str:
+    """
+    Clean and validate a user-supplied brand domain.
+
+    Accepts URLs ('https://www.paypal.com/'), bare domains ('uir.ac.ma'),
+    and trailing-slash variants. Returns the normalised domain or raises
+    ValueError if it does not look like a real domain.
+    """
+    s = raw.strip().lower()
+    for scheme in ("https://", "http://", "ftp://"):
+        if s.startswith(scheme):
+            s = s[len(scheme):]
+    if s.startswith("www."):
+        s = s[4:]
+    s = s.split("/")[0]
+    if not _INPUT_DOMAIN_RE.match(s):
+        raise ValueError(
+            f"'{raw}' does not look like a valid domain. "
+            "Try something like 'paypal.com' or 'uir.ac.ma'."
+        )
+    return s
+
+
+def resolve_brand_profile(domain: str) -> BrandProfile:
+    """Use the curated profile for known brands, otherwise auto-derive one."""
+    domain = domain.strip().lower()
+    if domain in KNOWN_PROFILES:
+        return KNOWN_PROFILES[domain]
+    return BrandProfile.from_domain(domain)
+
+
+def run_pipeline_with_status(domain_input: str):
+    """Run all three pipeline stages and stream progress into an st.status panel."""
+    init_db()
+    profile = resolve_brand_profile(domain_input)
+    deleted = clear_brand(profile.name)
+
+    with st.status(f"Scanning '{profile.domain}'...", expanded=True) as status:
+        st.write(f"Brand resolved: **{profile.name}** (canonical domain "
+                 f"`{profile.domain}`)")
+        if deleted:
+            st.write(f"Cleared {deleted} previous indicator(s) for this brand")
+
+        st.write("**Stage 1/3 — Collection** (typically 1–3 minutes)")
+        st.write("Querying crt.sh and generating dnstwist look-alikes...")
+        n_collected = run_collection(profile)
+        st.write(f"✓ Collected **{n_collected}** unique indicators")
+
+        st.write("**Stage 2/3 — Processing & enrichment** (typically 1–3 minutes)")
+        st.write("Normalising, deduplicating, and looking up WHOIS data...")
+        n_enriched = run_processing(profile)
+        st.write(f"✓ Enriched **{n_enriched}** unique registered domains")
+
+        st.write("**Stage 3/3 — Scoring & correlation** (seconds)")
+        n_scored = run_scoring(profile)
+        st.write(f"✓ Scored **{n_scored}** indicators")
+
+        status.update(label=f"Scan complete: {profile.domain}",
+                      state="complete", expanded=False)
+
+    st.cache_data.clear()
+    st.session_state["selected_brand"] = profile.name
+
+
+# --------------------------------------------------------------------------
+# Header + search bar
+# --------------------------------------------------------------------------
+st.title("OSINT-Based Threat Intelligence")
+st.caption("Early detection of phishing campaigns by monitoring open-source intelligence")
+
+with st.container(border=True):
+    st.subheader("Monitor a brand")
+    st.markdown(
+        "Enter a domain to scan for look-alike registrations and potential "
+        "phishing infrastructure. A full scan takes 3–6 minutes."
+    )
+
+    col_input, col_btn = st.columns([5, 1])
+    with col_input:
+        user_input = st.text_input(
+            "Brand domain",
+            placeholder="e.g. paypal.com, uir.ac.ma, your-bank.com",
+            label_visibility="collapsed",
+        )
+    with col_btn:
+        scan_clicked = st.button("Scan", type="primary", width="stretch")
+
+    if scan_clicked:
+        if not user_input.strip():
+            st.error("Please enter a domain.")
+        else:
+            try:
+                cleaned = normalize_input(user_input)
+            except ValueError as e:
+                st.error(str(e))
+            else:
+                try:
+                    run_pipeline_with_status(cleaned)
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Pipeline failed: {e}")
+
+
+# --------------------------------------------------------------------------
+# Brand selector (sidebar)
+# --------------------------------------------------------------------------
+brands = list_brands()
+if not brands:
+    st.info("No scan results yet. Enter a domain above to start monitoring.")
+    st.stop()
+
+brand_names = [b["brand"] for b in brands]
+default_idx = 0
+preselected = st.session_state.get("selected_brand")
+if preselected and preselected in brand_names:
+    default_idx = brand_names.index(preselected)
+
+st.sidebar.header("Brand")
+current_brand = st.sidebar.selectbox(
+    "Brand to display",
+    options=brand_names,
+    index=default_idx,
+)
+st.sidebar.caption(f"{len(brands)} brand(s) scanned so far")
+
+
+# --------------------------------------------------------------------------
+# Load data for the selected brand
+# --------------------------------------------------------------------------
 @st.cache_data
 def load_data(brand: str) -> pd.DataFrame:
-    """Load scored indicators for one brand into a DataFrame."""
     indicators = get_indicators(status="scored", brand=brand)
     rows = []
     for i in indicators:
@@ -46,33 +186,14 @@ def load_data(brand: str) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-# --------------------------------------------------------------------------
-# Pick a brand to display
-# --------------------------------------------------------------------------
-brands = list_brands()
-
-st.title("OSINT-Based Threat Intelligence")
-
-if not brands:
-    st.warning("No data in the database yet. Run "
-               "`python main.py <domain>` to populate it.")
-    st.stop()
-
-brand_names = [b["brand"] for b in brands]
-current_brand = st.sidebar.selectbox(
-    "Brand to display",
-    options=brand_names,
-    index=0,
-)
-st.caption(f"Early detection of phishing campaigns impersonating "
-           f"'{current_brand}'")
-
 df = load_data(current_brand)
 if df.empty:
     st.warning(f"No scored indicators for '{current_brand}'.")
     st.stop()
 
 scored_indicators = get_indicators(status="scored", brand=current_brand)
+
+st.subheader(f"Results for: `{current_brand}`")
 
 
 # --------------------------------------------------------------------------
@@ -92,7 +213,6 @@ st.divider()
 # Sidebar filters
 # --------------------------------------------------------------------------
 st.sidebar.header("Filters")
-
 levels = st.sidebar.multiselect(
     "Risk level",
     options=["CRITICAL", "HIGH", "MEDIUM", "LOW"],
@@ -107,7 +227,6 @@ if levels:
 view = view[view.score >= min_score]
 if search:
     view = view[view.domain.str.contains(search, case=False, na=False)]
-
 view = view.sort_values("score", ascending=False)
 
 
