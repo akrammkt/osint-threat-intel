@@ -1,10 +1,11 @@
 """
 core/database.py
 -----------------
-SQLite persistence layer for the OSINT threat-intelligence pipeline.
+SQLite persistence layer.
 
-Every pipeline stage talks to the same SQLite database file through these
-functions. Complex fields (raw, enrichment) are stored as JSON text.
+The indicators table now carries a `brand` column so multiple brands can
+coexist in the same database. Indicators are uniquely keyed on (value, brand)
+- the same domain can appear under two brands if both happen to monitor it.
 """
 
 import sqlite3
@@ -12,7 +13,6 @@ import json
 from pathlib import Path
 from core.schema import Indicator
 
-# The database file lives in the project's data/ folder.
 DB_PATH = Path(__file__).resolve().parent.parent / "data" / "indicators.db"
 
 
@@ -20,7 +20,7 @@ def get_connection() -> sqlite3.Connection:
     """Open a connection to the SQLite database (creates the file if needed)."""
     DB_PATH.parent.mkdir(exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row   # lets us access columns by name
+    conn.row_factory = sqlite3.Row
     return conn
 
 
@@ -30,7 +30,8 @@ def init_db() -> None:
     conn.execute("""
         CREATE TABLE IF NOT EXISTS indicators (
             id             TEXT PRIMARY KEY,
-            value          TEXT UNIQUE,
+            value          TEXT,
+            brand          TEXT,
             source         TEXT,
             indicator_type TEXT,
             first_seen     TEXT,
@@ -39,7 +40,8 @@ def init_db() -> None:
             enrichment     TEXT,
             score          REAL,
             campaign_id    TEXT,
-            status         TEXT
+            status         TEXT,
+            UNIQUE(value, brand)
         )
     """)
     conn.commit()
@@ -55,19 +57,16 @@ def _row_to_indicator(row: sqlite3.Row) -> Indicator:
 
 
 def save_indicator(indicator: Indicator) -> None:
-    """
-    Insert an indicator, or replace it if one with the same id already exists.
-    Because the id is derived from the domain, this doubles as an update:
-    the processing and scoring stages just re-save the same indicator.
-    """
+    """Insert or replace one indicator (keyed on (value, brand))."""
     conn = get_connection()
     conn.execute("""
         INSERT OR REPLACE INTO indicators
-        (id, value, source, indicator_type, first_seen, collected_at,
+        (id, value, brand, source, indicator_type, first_seen, collected_at,
          raw, enrichment, score, campaign_id, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
-        indicator.id, indicator.value, indicator.source, indicator.indicator_type,
+        indicator.id, indicator.value, indicator.brand,
+        indicator.source, indicator.indicator_type,
         indicator.first_seen, indicator.collected_at,
         json.dumps(indicator.raw), json.dumps(indicator.enrichment),
         indicator.score, indicator.campaign_id, indicator.status,
@@ -77,32 +76,67 @@ def save_indicator(indicator: Indicator) -> None:
 
 
 def save_many(indicators: list) -> int:
-    """Save a list of indicators. Returns how many were processed."""
+    """Save a list of indicators. Returns the count."""
     for ind in indicators:
         save_indicator(ind)
     return len(indicators)
 
 
-def get_indicators(status: str = None) -> list:
+def get_indicators(status: str = None, brand: str = None) -> list:
     """
-    Fetch indicators from the database.
-    If `status` is given, only indicators at that stage are returned
-    (e.g. "collected", "enriched", "scored").
+    Fetch indicators, optionally filtered by status and/or brand.
+    Both filters can be combined.
     """
     conn = get_connection()
+    query = "SELECT * FROM indicators WHERE 1=1"
+    params = []
     if status:
-        rows = conn.execute(
-            "SELECT * FROM indicators WHERE status = ?", (status,)
-        ).fetchall()
-    else:
-        rows = conn.execute("SELECT * FROM indicators").fetchall()
+        query += " AND status = ?"
+        params.append(status)
+    if brand:
+        query += " AND brand = ?"
+        params.append(brand)
+    rows = conn.execute(query, params).fetchall()
     conn.close()
     return [_row_to_indicator(r) for r in rows]
 
 
-def count_indicators() -> int:
-    """Return the total number of indicators stored."""
+def count_indicators(brand: str = None) -> int:
+    """Total indicators in the database (or for one brand if given)."""
     conn = get_connection()
-    n = conn.execute("SELECT COUNT(*) FROM indicators").fetchone()[0]
+    if brand:
+        n = conn.execute("SELECT COUNT(*) FROM indicators WHERE brand = ?",
+                         (brand,)).fetchone()[0]
+    else:
+        n = conn.execute("SELECT COUNT(*) FROM indicators").fetchone()[0]
     conn.close()
     return n
+
+
+def clear_brand(brand: str) -> int:
+    """
+    Delete every indicator for a given brand. Used at the start of a pipeline
+    run so the brand's data is rebuilt from scratch while other brands'
+    historical data is preserved.
+    """
+    conn = get_connection()
+    cur = conn.execute("DELETE FROM indicators WHERE brand = ?", (brand,))
+    conn.commit()
+    deleted = cur.rowcount
+    conn.close()
+    return deleted
+
+
+def list_brands() -> list:
+    """
+    Return the distinct brands present in the database, newest first.
+    Each entry is a dict with keys: brand, last_seen, n.
+    """
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT brand, MAX(collected_at) AS last_seen, COUNT(*) AS n "
+        "FROM indicators WHERE brand != '' "
+        "GROUP BY brand ORDER BY last_seen DESC"
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]

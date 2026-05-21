@@ -1,11 +1,14 @@
 """
 dashboard.py
 -------------
-Streamlit dashboard - the dissemination layer's visual interface.
+Streamlit dashboard.
 
-Presents the scored indicators from the database as an interactive threat
-console: summary metrics, filters, a ranked threat table, the campaign view,
-charts, an alert panel, and IOC report export.
+Reads the latest brand from the database and presents its scored indicators
+as an interactive threat console: summary metrics, filters, a ranked threat
+table, the campaign view, charts, an alert panel, and IOC report export.
+
+In Step 12 this gains a search bar that triggers per-brand pipeline runs.
+For now it just displays whichever brand was most recently collected.
 
 Run from the project root with:  streamlit run dashboard.py
 """
@@ -14,22 +17,18 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-from core.database import get_indicators, count_indicators
-from config import PROTECTED_BRAND
+from core.database import get_indicators, list_brands
 from dissemination.alerting import get_alerts, write_alert_log, ALERT_THRESHOLD
 from dissemination.exporter import export_csv, export_json
 
 
-# --------------------------------------------------------------------------
-# Page setup
-# --------------------------------------------------------------------------
 st.set_page_config(page_title="OSINT Threat Intelligence", layout="wide")
 
 
 @st.cache_data
-def load_data() -> pd.DataFrame:
-    """Load scored indicators from the database into a DataFrame."""
-    indicators = get_indicators(status="scored")
+def load_data(brand: str) -> pd.DataFrame:
+    """Load scored indicators for one brand into a DataFrame."""
+    indicators = get_indicators(status="scored", brand=brand)
     rows = []
     for i in indicators:
         e = i.enrichment
@@ -48,21 +47,32 @@ def load_data() -> pd.DataFrame:
 
 
 # --------------------------------------------------------------------------
-# Header
+# Pick a brand to display
 # --------------------------------------------------------------------------
+brands = list_brands()
+
 st.title("OSINT-Based Threat Intelligence")
-st.caption(f"Early detection of phishing campaigns impersonating "
-           f"'{PROTECTED_BRAND}'")
 
-df = load_data()
-
-if df.empty:
-    st.warning("No scored indicators found. Run `python main.py` first to "
-               "populate the database, then refresh this page.")
+if not brands:
+    st.warning("No data in the database yet. Run "
+               "`python main.py <domain>` to populate it.")
     st.stop()
 
-# Keep the original objects around for alerting and export.
-scored_indicators = get_indicators(status="scored")
+brand_names = [b["brand"] for b in brands]
+current_brand = st.sidebar.selectbox(
+    "Brand to display",
+    options=brand_names,
+    index=0,
+)
+st.caption(f"Early detection of phishing campaigns impersonating "
+           f"'{current_brand}'")
+
+df = load_data(current_brand)
+if df.empty:
+    st.warning(f"No scored indicators for '{current_brand}'.")
+    st.stop()
+
+scored_indicators = get_indicators(status="scored", brand=current_brand)
 
 
 # --------------------------------------------------------------------------
@@ -108,7 +118,6 @@ tab1, tab2, tab3, tab4 = st.tabs(
     ["Threat list", "Campaigns", "Analytics", "Alerts & export"]
 )
 
-# --- Tab 1: ranked threat table -------------------------------------------
 with tab1:
     st.subheader(f"Ranked threats ({len(view)} shown)")
     st.dataframe(
@@ -118,7 +127,6 @@ with tab1:
         hide_index=True,
     )
 
-# --- Tab 2: campaign view -------------------------------------------------
 with tab2:
     campaigns = df[df.campaign != ""]
     if campaigns.empty:
@@ -136,7 +144,6 @@ with tab2:
                     width="stretch", hide_index=True,
                 )
 
-# --- Tab 3: analytics charts ----------------------------------------------
 with tab3:
     c1, c2 = st.columns(2)
     with c1:
@@ -162,7 +169,6 @@ with tab3:
     fig3 = px.line(timeline, x="first_seen", y="count", markers=True)
     st.plotly_chart(fig3, width="stretch")
 
-# --- Tab 4: alerts and export ---------------------------------------------
 with tab4:
     st.subheader(f"Active alerts (score >= {ALERT_THRESHOLD})")
     alerts = get_alerts(scored_indicators)

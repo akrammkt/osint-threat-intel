@@ -1,32 +1,29 @@
 """
 collection/runner.py
 ---------------------
-Runs every OSINT collector, then saves the discovered indicators to the database.
-
-When two collectors find the SAME domain, their findings are MERGED rather than
-overwritten: the `source` field becomes a comma-separated list of every source
-that flagged the domain (e.g. "crt.sh,dnstwist"). This cross-source
-corroboration is a key threat signal used later by the scoring stage.
+Runs every OSINT collector for a given BrandProfile and saves the discovered
+indicators to the database. When two collectors find the same domain, their
+findings are merged into a single indicator with the union of sources.
 """
 
 from core.database import init_db, save_many
+from core.schema import BrandProfile
 from collection import crtsh_collector, dnstwist_collector
 
-# Every collector module must expose a collect() -> list[Indicator] function.
+# Every collector module must expose a collect(profile) -> list[Indicator] function.
 COLLECTORS = [crtsh_collector, dnstwist_collector]
 
 
-def run_collection() -> int:
-    """Run all collectors, merge their results, and store them. Returns the count saved."""
+def run_collection(profile: BrandProfile) -> int:
+    """Run all collectors for the brand, merge their results, save them."""
     init_db()
     merged = {}
 
     for collector in COLLECTORS:
-        for ind in collector.collect():
+        for ind in collector.collect(profile):
             if ind.value in merged:
-                # same domain found by another source -> merge, do not overwrite
                 existing = merged[ind.value]
-                sources = set(existing.source.split(",")) | {ind.source}
+                sources = set(existing.source.split(",")) | set(ind.source.split(","))
                 existing.source = ",".join(sorted(sources))
                 existing.raw.update(ind.raw)
             else:
